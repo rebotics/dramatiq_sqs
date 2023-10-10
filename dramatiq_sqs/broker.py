@@ -2,10 +2,12 @@ import json
 import os
 from base64 import b64decode, b64encode
 from collections import deque
+from threading import Event
 from typing import Any, Dict, Iterable, List, Optional, Sequence, TypeVar
 
 import boto3
 import dramatiq
+from dramatiq.common import compute_backoff
 from dramatiq.logging import get_logger
 
 #: The max number of bytes in a message.
@@ -179,13 +181,16 @@ class SQSConsumer(dramatiq.Consumer):
         self.queue = queue
         self.prefetch = min(prefetch, MAX_PREFETCH)
         self.visibility_timeout = MAX_VISIBILITY_TIMEOUT
-        self.timeout = timeout  # UNUSED
+        self.timeout = timeout
         self.messages: deque = deque()
-        self.message_refc = 0
+        self.in_flight_messages_count = 0
+        self._need_stop = Event()
+        self._prefetch_filled_attempt = 0
 
     def ack(self, message: "_SQSMessage") -> None:
+        # TODO: thread safety
         message._sqs_message.delete()
-        self.message_refc -= 1
+        self.in_flight_messages_count -= 1
 
     #: Messages are added to DLQ by SQS redrive policy, so no actions are necessary
     nack = ack
@@ -208,7 +213,7 @@ class SQSConsumer(dramatiq.Consumer):
                 "ReceiptHandle": message._sqs_message.receipt_handle,
             } for i, message in enumerate(requeued_messages)])
 
-            self.message_refc -= len(requeued_messages)
+            self.in_flight_messages_count -= len(requeued_messages)
 
     def __next__(self) -> Optional[dramatiq.Message]:
         kw = {
@@ -221,20 +226,35 @@ class SQSConsumer(dramatiq.Consumer):
         try:
             return self.messages.popleft()
         except IndexError:
-            if self.message_refc < self.prefetch:
-                for sqs_message in self.queue.receive_messages(**kw):
-                    try:
-                        encoded_message = b64decode(sqs_message.body)
-                        dramatiq_message = dramatiq.Message.decode(encoded_message)
-                        self.messages.append(_SQSMessage(sqs_message, dramatiq_message))
-                        self.message_refc += 1
-                    except Exception:  # pragma: no cover
-                        self.logger.exception("Failed to decode message: %r", sqs_message.body)
+            if self.in_flight_messages_count >= self.prefetch:
+                # If prefetch cache is filled, we need to wait until messages would be processed.
+                #  Possible improvement here is to add an event from Workers to wake up as soon
+                #  as anyone is free.
+                self._prefetch_filled_attempt, delay_ms = compute_backoff(
+                    attempts=self._prefetch_filled_attempt,
+                    max_backoff=self.timeout,
+                )
+                self._need_stop.wait(delay_ms / 1000)
+                return None
+
+            # If there are fewer messages currently being processed than
+            #  we're allowed to prefetch, prefetch up to that number of messages.
+            for sqs_message in self.queue.receive_messages(**kw):
+                try:
+                    encoded_message = b64decode(sqs_message.body)
+                    dramatiq_message = dramatiq.Message.decode(encoded_message)
+                    self.messages.append(_SQSMessage(sqs_message, dramatiq_message))
+                    self.in_flight_messages_count += 1
+                except Exception:  # pragma: no cover
+                    self.logger.exception("Failed to decode message: %r", sqs_message.body)
 
             try:
                 return self.messages.popleft()
             except IndexError:
                 return None
+
+    def close(self):
+        self._need_stop.set()
 
 
 class _SQSMessage(dramatiq.MessageProxy):
