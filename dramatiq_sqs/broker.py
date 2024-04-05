@@ -69,6 +69,7 @@ class SQSBroker(dramatiq.Broker):
             middleware: Optional[List[dramatiq.Middleware]] = None,
             retention: int = MAX_MESSAGE_RETENTION,
             dead_letter: bool = False,
+            create_queue: bool = True,
             max_receives: int = MAX_RECEIVES,
             tags: Optional[Dict[str, str]] = None,
             **options,
@@ -82,6 +83,7 @@ class SQSBroker(dramatiq.Broker):
         self.retention: str = str(retention)
         self.queues: Dict[str, Any] = {}
         self.dead_letter: bool = dead_letter
+        self.create_queue: bool = create_queue
         self.max_receives: int = max_receives
         self.tags: Optional[Dict[str, str]] = tags
         self.sqs: Any = boto3.resource("sqs", **options)
@@ -112,6 +114,8 @@ class SQSBroker(dramatiq.Broker):
                     QueueName=prefixed_queue_name,
                 )
             except self.sqs.meta.client.exceptions.QueueDoesNotExist:
+                if not self.create_queue:
+                    raise
                 self.queues[queue_name] = self.sqs.create_queue(
                     QueueName=prefixed_queue_name,
                     Attributes={
